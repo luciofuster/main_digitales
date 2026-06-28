@@ -124,6 +124,7 @@ typedef enum {
 // Límites de ganancia: ±10 dB → escala lineal [0.316, 3.162]
 //#define GAIN_DB_MIN     -10.0f
 //#define GAIN_DB_MAX      10.0f
+//#define GAIN_DB_DEFAULT   0.0f
 #define GAIN_DB_MIN     -24.0f
 #define GAIN_DB_MAX      24.0f
 #define GAIN_DB_DEFAULT   0.0f
@@ -390,8 +391,9 @@ static void init_fir_bands(void)
 
 static void dsp_task(void *pv)
 {
+    float gg = db_to_linear(MASTER_GAIN);
     const float SCALE_IN  = 1.0f / (float)0x7FFFFF;
-    const float SCALE_OUT = (float)0x7FFFFF;
+    const float SCALE_OUT = (float)0x7FFFFF * gg;
     const float CLAMP_MAX =  (float)0x7FFFFF;
     const float CLAMP_MIN = -(float)0x800000;
 
@@ -411,7 +413,7 @@ static void dsp_task(void *pv)
         float gl = db_to_linear(p.gain_db_low);
         float gm = db_to_linear(p.gain_db_mid);
         float gh = db_to_linear(p.gain_db_high);
-        float gg = db_to_linear(MASTER_GAIN);
+
         // ── 1. desintercalado int32_t estéreo → float mono por canal ──────────
         // El PCM1808 entrega 24 bits justificados a la izquierda en int32_t,
         // los 8 bits bajos son siempre 0 → shift derecho para normalizar.
@@ -432,8 +434,8 @@ static void dsp_task(void *pv)
 
         // ── 3. Suma con ganancia + intercalado + conversión a int32_t ─────────
         for (int i = 0; i < FRAMES_PER_BUF; i++) {
-            float outL = (gl * out_lp[0][i] + gm * out_bp[0][i] + gh * out_hp[0][i])*gg;
-            float outR = (gl * out_lp[1][i] + gm * out_bp[1][i] + gh * out_hp[1][i])*gg;
+            float outL = gl * out_lp[0][i] + gm * out_bp[0][i] + gh * out_hp[0][i];
+            float outR = gl * out_lp[1][i] + gm * out_bp[1][i] + gh * out_hp[1][i];
 
             outL *= SCALE_OUT;
             outR *= SCALE_OUT;
@@ -661,10 +663,15 @@ static void uart_task(void *pv)
 
 #define ENCODER_SW_DEBOUNCE_MS  50
 
-// ISR de CLK — único flanco que dispara la lectura de dirección
+// ISR de CLK — único flanco que dispara la lectura de dirección.
+// CRÍTICO: gpio_intr_disable() NO es seguro de llamar desde una ISR — toma
+// un spinlock interno (portENTER_CRITICAL) pensado para contexto de tarea,
+// no para contexto de interrupción. Llamarlo aquí puede causar un panic /
+// reset aleatorio del ESP32, sobre todo si el encoder gira rápido y esta
+// ISR se reentra mientras el spinlock ya está tomado. La ISR debe limitarse
+// a leer el pin y encolar — nada de tocar configuración de interrupciones.
 static void IRAM_ATTR encoder_clk_isr(void *arg)
 {
-    gpio_intr_disable(ENCODER_CLK);
     int dt = gpio_get_level(ENCODER_DT);
     encoder_event_t evt = dt ? ENCODER_EVT_ROTATE_CW : ENCODER_EVT_ROTATE_CCW;
     BaseType_t woken = pdFALSE;
@@ -672,12 +679,11 @@ static void IRAM_ATTR encoder_clk_isr(void *arg)
     portYIELD_FROM_ISR(woken);
 }
 
-// ISR del pulsador SW — flanco descendente (activo en bajo)
+// ISR del pulsador SW — flanco descendente (activo en bajo).
+// Igual que arriba: solo encola, no deshabilita nada. El debounce real
+// (deshabilitar/rehabilitar la interrupción) se hace en encoder_task.
 static void IRAM_ATTR encoder_sw_isr(void *arg)
 {
-    // Deshabilitar la ISR del SW para debounce — la tarea la rehabilita
-    gpio_intr_disable(ENCODER_SW);
-
     encoder_event_t evt = ENCODER_EVT_BUTTON;
     BaseType_t woken = pdFALSE;
     xQueueSendFromISR(encoder_queue, &evt, &woken);
@@ -722,6 +728,16 @@ static void encoder_task(void *pv)
     gpio_isr_handler_add(ENCODER_SW,  encoder_sw_isr,  NULL);
 
     encoder_event_t evt;
+
+    // Debounce por tiempo, no por deshabilitar interrupciones: se guarda el
+    // tick de la última pulsación de SW aceptada, y cualquier flanco que
+    // llegue antes de ENCODER_SW_DEBOUNCE_MS se descarta. Esto reemplaza el
+    // patrón anterior (gpio_intr_disable en la ISR + vTaskDelay + enable),
+    // que además de ser inseguro desde ISR dejaba una ventana de carrera:
+    // un segundo rebote podía llegar antes de que la ISR llegara a
+    // deshabilitarse a sí misma.
+    TickType_t last_sw_tick = 0;
+
     while (1) {
         // Bloquear hasta que alguna ISR encole un evento
         if (xQueueReceive(encoder_queue, &evt, portMAX_DELAY) != pdPASS) continue;
@@ -742,14 +758,24 @@ static void encoder_task(void *pv)
 
             xQueueOverwrite(param_config_queue, &p);
 
-            // Rehabilitar ISR del SW luego del período de debounce
-            vTaskDelay(pdMS_TO_TICKS(100));
-            gpio_intr_enable(ENCODER_CLK);
-
             // Hubo cambio de ganancia → avisar a flash_task para que persista.
             xSemaphoreGive(change_semaphore);
 
+            // Sin vTaskDelay aquí: la ISR de CLK nunca se deshabilita, así
+            // que no hay nada que "rehabilitar". Bloquear la tarea en cada
+            // paso de giro solo hacía que se sintiera trabado y se perdieran
+            // pasos rápidos.
+
         } else if (evt == ENCODER_EVT_BUTTON) {
+            TickType_t now = xTaskGetTickCount();
+
+            // Descartar flancos de rebote: si no pasó el tiempo mínimo desde
+            // la última pulsación aceptada, se ignora este evento entero.
+            if ((now - last_sw_tick) < pdMS_TO_TICKS(ENCODER_SW_DEBOUNCE_MS)) {
+                continue;
+            }
+            last_sw_tick = now;
+
             p.selected_band = (p.selected_band + 1) % 3;
             xQueueOverwrite(param_config_queue, &p);
 
@@ -758,10 +784,6 @@ static void encoder_task(void *pv)
                      p.selected_band == 1 ? "MID" : "HIGH");
 
             // Cambiar de banda no modifica ganancia → no se notifica a flash_task
-
-            // Rehabilitar ISR del SW luego del período de debounce
-            vTaskDelay(pdMS_TO_TICKS(ENCODER_SW_DEBOUNCE_MS));
-            gpio_intr_enable(ENCODER_SW);
         }
     }
 }
@@ -973,7 +995,7 @@ static void lcd_task(void *pv)
         // le permite a GCC garantizar en compilación que no hay truncamiento,
         // eliminando el warning -Werror=format-truncation: con line1[21] el
         // compilador calcula el peor caso teórico de %f y lo rechaza, aunque esté acotado a ±10 dB.
-        snprintf(line1, sizeof(line1), "L:%+3.0fdB M:%+2.0fdB H:%+3.0fdB",
+        snprintf(line1, sizeof(line1), "L:%+3.0fdB M:%+3.0fdB H:%+3.0fdB",
                  p.gain_db_low, p.gain_db_mid, p.gain_db_high);
 
         // Fila 2: cursor "^" bajo la banda seleccionada.
