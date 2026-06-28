@@ -148,7 +148,16 @@ static QueueHandle_t    param_config_queue; // profundidad 1: eq_params_t compar
 static QueueHandle_t    uart_event_queue;   // cola nativa del driver UART (eventos del hardware, vía ISR interna)
 static QueueHandle_t    encoder_queue;      // cola propia: encoder_event_t desde las ISRs del encoder
 static SemaphoreHandle_t change_semaphore;  // semáforo binario: lo dan uart_task/encoder_task al modificar ganancia
-static SemaphoreHandle_t dsp_done_sem;      // semáforo binario: lo da dsp
+
+// Bits del notify value de guardian_task. Antes había dos mecanismos
+// distintos en el mismo core 0: la ISR de I2S usaba task notify
+// (vTaskNotifyGiveFromISR) y el DSP usaba un semáforo aparte (dsp_done_sem).
+// Se unifican ambas señales en el ÚNICO notify value de guardian_task,
+// usando bits distintos para no perder una señal mientras se espera la otra:
+//   bit 0 (I2S_RX_DONE_BIT) → lo da la ISR de I2S cuando el DMA llenó un buffer
+//   bit 1 (DSP_DONE_BIT)    → lo da dsp_task cuando terminó de procesar
+#define I2S_RX_DONE_BIT   (1 << 0)
+#define DSP_DONE_BIT      (1 << 1)
 
 // =============================================================================
 // Triple buffer
@@ -189,7 +198,9 @@ static bool IRAM_ATTR i2s_rx_done_cb(i2s_chan_handle_t  handle,
                                       void              *user_ctx)
 {
     BaseType_t woken = pdFALSE;
-    vTaskNotifyGiveFromISR(guardian_handle, &woken);
+    // eSetBits: setea I2S_RX_DONE_BIT sin afectar DSP_DONE_BIT, que puede
+    // estar pendiente de una notificación anterior del DSP todavía no leída.
+    xTaskNotifyFromISR(guardian_handle, I2S_RX_DONE_BIT, eSetBits, &woken);
     // Retornar true le indica al driver que haga portYIELD_FROM_ISR internamente
     return woken == pdTRUE;
 }
@@ -445,8 +456,11 @@ static void dsp_task(void *pv)
             (*buf)[i * 2    ] = (int32_t)outL << 8;  // L justificado izquierda
             (*buf)[i * 2 + 1] = (int32_t)outR << 8;  // R justificado izquierda
         }
-        // Notificar al guardián que el buffer está listo
-        xSemaphoreGive(dsp_done_sem);
+        // Notificar al guardián que el buffer está listo.
+        // eSetBits con DSP_DONE_BIT: no toca I2S_RX_DONE_BIT, que puede
+        // estar pendiente si la ISR de I2S ya disparó antes de que el
+        // guardián llegue a leer esta notificación.
+        xTaskNotify(guardian_handle, DSP_DONE_BIT, eSetBits);
     }
 }
 
@@ -458,21 +472,6 @@ static void dsp_task(void *pv)
 
 static void guardian_task(void *pv)
 {
-    // Registrar el callback — se hace aquí para garantizar que guardian_handle
-    // ya fue asignado antes de que llegue la primera interrupción.
-    /*i2s_event_callbacks_t cbs = {
-        .on_recv       = i2s_rx_done_cb,
-        .on_recv_q_ovf = NULL,
-        .on_sent       = NULL,
-        .on_send_q_ovf = NULL,
-    };
-    ESP_LOGI(TAG, "Registrando callback");
-    esp_err_t err =
-    i2s_channel_register_event_callback(i2s_rx_handle, &cbs, NULL);
-    ESP_LOGI(TAG, "callback = %s", esp_err_to_name(err));
-
-    */
-
     // ── Arranque ─────────────────────────────────────────────────────────────
     // Escribo ceros para que el DAC no emita ruido mientras el DSP no ha
     // procesado nada todavía. Usa el slot tx actual (inicializado en cero).
@@ -488,8 +487,6 @@ static void guardian_task(void *pv)
          written,
          (uint32_t)(*buf_tx)[0],
          (uint32_t)(*buf_tx)[1]);
-
-    //ESP_LOGI(TAG, "Despues de write, written=%d", written);
 
     // Primer read bloqueante — sincroniza con el ADC
     size_t read;
@@ -516,10 +513,18 @@ static void guardian_task(void *pv)
 
     // ── Bucle principal ───────────────────────────────────────────────────────
     while (1) {
-        // Esperar notificación de la ISR (un buffer ADC nuevo está disponible en el DMA)
-        //ESP_LOGI(TAG, "Esperando callback");
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
-        //ESP_LOGI(TAG, "Callback recibido");
+        // Esperar específicamente I2S_RX_DONE_BIT (lo da la ISR de I2S).
+        // ulBitsToClearOnExit = I2S_RX_DONE_BIT: solo se limpia este bit al
+        // salir, dejando DSP_DONE_BIT intacto si ya hubiese llegado antes
+        // (por ejemplo, si el DSP terminó muy rápido en el ciclo anterior
+        // y esa notificación quedó pendiente). Antes, con ulTaskNotifyTake,
+        // cualquier notificación limpiaba todo el valor — correcto cuando
+        // había un solo emisor, pero no servía para diferenciar dos señales.
+        uint32_t notif = 0;
+        do {
+            xTaskNotifyWait(0, I2S_RX_DONE_BIT, &notif, portMAX_DELAY);
+        } while ((notif & I2S_RX_DONE_BIT) == 0);
+
         // Leer buffer del ADC → slot RX actual.
         // El dato ya está disponible porque la ISR nos despertó.
         i2s_channel_read(i2s_rx_handle,
@@ -535,8 +540,12 @@ static void guardian_task(void *pv)
                           &written,
                           0);
         
-        // Esperar que el DSP haya terminado con buf_dsp antes de rotarlo
-        xSemaphoreTake(dsp_done_sem, portMAX_DELAY);
+        // Esperar específicamente DSP_DONE_BIT antes de rotar buf_dsp.
+        // Mismo patrón que arriba: solo limpia DSP_DONE_BIT, sin tocar
+        // I2S_RX_DONE_BIT si ya llegó adelantado para el próximo ciclo.
+        do {
+            xTaskNotifyWait(0, DSP_DONE_BIT, &notif, portMAX_DELAY);
+        } while ((notif & DSP_DONE_BIT) == 0);
         // Rotar roles — intercambio de 3 punteros:
         //   viejo RX  (recién leído)      → DSP
         //   viejo DSP (ya procesado)      → TX
@@ -546,10 +555,12 @@ static void guardian_task(void *pv)
         buf_tx  = buf_dsp;
         buf_dsp = old_rx;
         /*
-         Al enviar el puntero del nuevo buffer al DSP, si el DSP aún no terminó de
-         procesar el anterior, no queremos que se bloquee la tarea guardiana.
-         Con xQueueOverwrite lo reemplaza en la cola, asegurando que si por
-         alguna razón el DSP no responde a tiempo la guardiana nunca se bloquee.
+         xQueueOverwrite nunca bloquea por sí mismo (reemplaza el mensaje
+         anterior si la cola está llena), pero quien realmente sincroniza
+         con el DSP es el xTaskNotifyWait(DSP_DONE_BIT) de más arriba: la
+         guardiana ya esperó a que el DSP termine de leer buf_dsp antes de
+         llegar a esta rotación, así que el puntero que se envía a
+         continuación siempre apunta a un buffer libre y ya rotado.
         */
         taskYIELD();   // <-- agregar acá, línea 491
         xQueueOverwrite(dsp_queue, &buf_dsp); // enviar el nuevo buffer al DSP
@@ -627,7 +638,6 @@ static void uart_task(void *pv)
 
                 xQueueOverwrite(param_config_queue, &p);
 
-                // Avisar a flash_task que hubo un cambio de ganancia para que
                 xSemaphoreGive(change_semaphore);
 
                 uart_write_bytes(UART_PORT, "OK\n", 3);
@@ -640,36 +650,14 @@ static void uart_task(void *pv)
             xQueueReset(uart_event_queue); // limpiar la cola de eventos para evitar procesar eventos obsoletos
             ESP_LOGW(TAG, "UART overflow — buffer reiniciado"); //aviso en logs sin bloquear sistema
         }
-        // Otros tipos de evento (BREAK, PARITY_ERR, etc.) se ignoran aquí.
     }
 }
 
 // =============================================================================
 // Encoder rotativo — ISRs + tarea (core 1)
 // =============================================================================
-//
-// Pinout real del encoder
-//   CLK = señal A    DT = señal B    SW = pulsador
-//
-//   La ISR solo se dispara en el FLANCO DESCENDENTE de CLK.
-//   En ese instante se lee el nivel de DT:
-//     DT == 1 (alto)  → giro CW  (DT va "adelantado" respecto a CLK)
-//     DT == 0 (bajo)  → giro CCW (DT va "atrasado"   respecto a CLK)
-//   Es el método solo tiene 1 problema, si el usuario hace solo un paso
-//   en donde CLK no hace un flanco descendente no se detecta el giro
-//   por ser gray, pero es simple de implementar y no requiere antirrebotes.
-//   Por otra parte, el pulsador SW tambien se detecta con flanco descendente 
-//   y si tiene debounce por software.
-
 #define ENCODER_SW_DEBOUNCE_MS  50
 
-// ISR de CLK — único flanco que dispara la lectura de dirección.
-// CRÍTICO: gpio_intr_disable() NO es seguro de llamar desde una ISR — toma
-// un spinlock interno (portENTER_CRITICAL) pensado para contexto de tarea,
-// no para contexto de interrupción. Llamarlo aquí puede causar un panic /
-// reset aleatorio del ESP32, sobre todo si el encoder gira rápido y esta
-// ISR se reentra mientras el spinlock ya está tomado. La ISR debe limitarse
-// a leer el pin y encolar — nada de tocar configuración de interrupciones.
 static void IRAM_ATTR encoder_clk_isr(void *arg)
 {
     int dt = gpio_get_level(ENCODER_DT);
@@ -679,9 +667,6 @@ static void IRAM_ATTR encoder_clk_isr(void *arg)
     portYIELD_FROM_ISR(woken);
 }
 
-// ISR del pulsador SW — flanco descendente (activo en bajo).
-// Igual que arriba: solo encola, no deshabilita nada. El debounce real
-// (deshabilitar/rehabilitar la interrupción) se hace en encoder_task.
 static void IRAM_ATTR encoder_sw_isr(void *arg)
 {
     encoder_event_t evt = ENCODER_EVT_BUTTON;
@@ -693,7 +678,6 @@ static void IRAM_ATTR encoder_sw_isr(void *arg)
 static void encoder_task(void *pv)
 {
     // ── Configurar GPIOs ────────────────────────────────────────────────────
-    // CLK: solo flanco descendente — es la única transición que dispara lectura
     gpio_config_t clk_cfg = {
         .pin_bit_mask = ((uint64_t)1 << ENCODER_CLK), // unit64_t porque tengo gpio mayor a 31
         .mode         = GPIO_MODE_INPUT,
@@ -703,7 +687,6 @@ static void encoder_task(void *pv)
     };
     gpio_config(&clk_cfg);
 
-    // DT: entrada simple, sin interrupción — solo se lee su nivel desde la ISR de CLK
     gpio_config_t dt_cfg = {
         .pin_bit_mask = ((uint64_t)1 << ENCODER_DT), // unit64_t porque tengo gpio mayor a 31
         .mode         = GPIO_MODE_INPUT,
@@ -713,7 +696,6 @@ static void encoder_task(void *pv)
     };
     gpio_config(&dt_cfg);
 
-    // SW: flanco descendente (pulsación)
     gpio_config_t sw_cfg = {
         .pin_bit_mask = ((uint64_t)1 << ENCODER_SW), // unit64_t porque tengo gpio mayor a 31
         .mode         = GPIO_MODE_INPUT,
@@ -723,26 +705,15 @@ static void encoder_task(void *pv)
     };
     gpio_config(&sw_cfg);
 
-    // Registrar ISRs (servicio de ISR de GPIO debe estar instalado — ver app_main)
     gpio_isr_handler_add(ENCODER_CLK, encoder_clk_isr, NULL);
     gpio_isr_handler_add(ENCODER_SW,  encoder_sw_isr,  NULL);
 
     encoder_event_t evt;
-
-    // Debounce por tiempo, no por deshabilitar interrupciones: se guarda el
-    // tick de la última pulsación de SW aceptada, y cualquier flanco que
-    // llegue antes de ENCODER_SW_DEBOUNCE_MS se descarta. Esto reemplaza el
-    // patrón anterior (gpio_intr_disable en la ISR + vTaskDelay + enable),
-    // que además de ser inseguro desde ISR dejaba una ventana de carrera:
-    // un segundo rebote podía llegar antes de que la ISR llegara a
-    // deshabilitarse a sí misma.
     TickType_t last_sw_tick = 0;
 
     while (1) {
-        // Bloquear hasta que alguna ISR encole un evento
         if (xQueueReceive(encoder_queue, &evt, portMAX_DELAY) != pdPASS) continue;
 
-        // Leer parámetros actuales — read-modify-write sobre la cola
         eq_params_t p;
         if (xQueuePeek(param_config_queue, &p, 0) != pdPASS) p = EQ_DEFAULTS;
 
@@ -761,16 +732,9 @@ static void encoder_task(void *pv)
             // Hubo cambio de ganancia → avisar a flash_task para que persista.
             xSemaphoreGive(change_semaphore);
 
-            // Sin vTaskDelay aquí: la ISR de CLK nunca se deshabilita, así
-            // que no hay nada que "rehabilitar". Bloquear la tarea en cada
-            // paso de giro solo hacía que se sintiera trabado y se perdieran
-            // pasos rápidos.
-
         } else if (evt == ENCODER_EVT_BUTTON) {
             TickType_t now = xTaskGetTickCount();
 
-            // Descartar flancos de rebote: si no pasó el tiempo mínimo desde
-            // la última pulsación aceptada, se ignora este evento entero.
             if ((now - last_sw_tick) < pdMS_TO_TICKS(ENCODER_SW_DEBOUNCE_MS)) {
                 continue;
             }
@@ -782,8 +746,6 @@ static void encoder_task(void *pv)
             ESP_LOGI(TAG, "Banda seleccionada: %s",
                      p.selected_band == 0 ? "LOW" :
                      p.selected_band == 1 ? "MID" : "HIGH");
-
-            // Cambiar de banda no modifica ganancia → no se notifica a flash_task
         }
     }
 }
@@ -791,8 +753,6 @@ static void encoder_task(void *pv)
 // =============================================================================
 // Tarea Flash / NVS (core 1) — persiste ganancias solo cuando cambian
 // =============================================================================
-
-
 static void flash_task(void *pv)
 {
     nvs_handle_t nvs;
@@ -806,7 +766,6 @@ static void flash_task(void *pv)
         eq_params_t p;
         if (xQueuePeek(param_config_queue, &p, 0) != pdPASS) continue;
 
-        // Union para type-punning seguro (vs. cast de puntero que es UB en C estricto)
         union { float f; int32_t i; } u;
 
         u.f = p.gain_db_low;  nvs_set_i32(nvs, NVS_KEY_LOW,  u.i);
@@ -826,8 +785,6 @@ static void flash_task(void *pv)
 // =============================================================================
 // Tarea LCD I2C (core 1) — muestra ganancias actuales
 // =============================================================================
-// Hardware: LCD2004 (20 columnas x 4 filas, HD44780) detrás de un backpack
-// PCF8574A, dirección 0x3F. Actualiza el display cada 1 segundo.
 //
 // Mapeo de pines PCF8574A → HD44780 (estándar de facto en estos backpacks):
 //   P0 → RS    P1 → RW    P2 → EN    P3 → Backlight (1 = encendido)
@@ -849,16 +806,12 @@ static void flash_task(void *pv)
 // Backlight se mantiene encendido por defecto en todas las escrituras.
 static uint8_t lcd_backlight = LCD_BIT_BL;
 
-// ── Primitiva de bajo nivel: escribe un byte crudo al PCF8574A ─────────────
 static esp_err_t lcd_i2c_write(uint8_t data)
 {
     return i2c_master_write_to_device(I2C_NUM_0, LCD_I2C_ADDR,
                                       &data, 1, pdMS_TO_TICKS(50));
 }
 
-// Pulsa EN: el HD44780 lee los 4 bits de datos en el flanco descendente de EN.
-// Los anchos de pulso (>450ns alto, >37us de ciclo) se cumplen sobrados por
-// la latencia natural de una transacción I2C completa, no se necesita delay.
 static void lcd_pulse_enable(uint8_t data)
 {
     lcd_i2c_write(data | LCD_BIT_EN);
@@ -867,7 +820,6 @@ static void lcd_pulse_enable(uint8_t data)
     vTaskDelay(pdMS_TO_TICKS(1));
 }
 
-// Envía un nibble (4 bits altos de 'nibble') manteniendo RS y backlight
 static void lcd_write_nibble(uint8_t nibble, bool is_data)
 {
     uint8_t data = lcd_backlight | (is_data ? LCD_BIT_RS : 0);
@@ -879,9 +831,6 @@ static void lcd_write_nibble(uint8_t nibble, bool is_data)
     lcd_pulse_enable(data);
 }
 
-// Envía un byte completo: nibble alto primero, luego nibble bajo.
-// is_data: true → byte de datos (RS=1, va a DDRAM/CGRAM)
-//          false → byte de comando (RS=0, instrucción del HD44780)
 static void lcd_write_byte(uint8_t byte, bool is_data)
 {
     lcd_write_nibble((byte >> 4) & 0x0F, is_data);
@@ -907,15 +856,11 @@ static void lcd_init(void)
     lcd_write_nibble(0x03, false);
     vTaskDelay(pdMS_TO_TICKS(1));
 
-    // Cambiar a modo 4-bit — a partir de aquí todo se envía en dos nibbles
     lcd_write_nibble(0x02, false);
     vTaskDelay(pdMS_TO_TICKS(1));
 
-    // Function set: 4-bit, 2 líneas, fuente de caracteres 5x8
     lcd_command(0x28);
-    // Display off, cursor off, blink off (apagar antes de configurar)
     lcd_command(0x08);
-    // Clear display
     lcd_command(0x01);
     vTaskDelay(pdMS_TO_TICKS(2));   // clear necesita >1.52ms
     // Entry mode set: incrementar cursor, sin shift de display
@@ -924,18 +869,6 @@ static void lcd_init(void)
     lcd_command(0x0C);
 }
 
-// definida por si acaso se ve mal
-/*
-lcd_clear(void)
-{
-    lcd_command(0x01);
-    vTaskDelay(pdMS_TO_TICKS(2));   // clear es el único comando que necesita espera larga
-}
-*/
-
-// Direcciones DDRAM de inicio de fila para un LCD2004 (controlador HD44780
-// con 4 líneas reales, no las 2 internas — el mapeo de filas 2 y 3 salta
-// 20 posiciones respecto al layout de 2 líneas).
 static const uint8_t LCD_ROW_OFFSETS[4] = {0x00, 0x40, 0x14, 0x54};
 
 static void lcd_set_cursor(int row, int col)
@@ -955,40 +888,9 @@ static void lcd_print(const char *s)
 
 static void lcd_task(void *pv)
 {
-/*
-    // Inicializar I2C
-    const i2c_config_t i2c_cfg = {
-        .mode             = I2C_MODE_MASTER,
-        .sda_io_num       = I2C_SDA_GPIO,
-        .scl_io_num       = I2C_SCL_GPIO,
-        .sda_pullup_en    = GPIO_PULLUP_ENABLE,
-        .scl_pullup_en    = GPIO_PULLUP_ENABLE,
-        .master.clk_speed = I2C_FREQ_HZ,
-    };
-    ESP_ERROR_CHECK(i2c_param_config(I2C_NUM_0, &i2c_cfg));
-    ESP_ERROR_CHECK(i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0));
-
-    lcd_init();
-    ESP_LOGI("LCD","Init terminado");
-*/
-    // Encabezado fijo — se escribe una sola vez, nunca cambia
     lcd_set_cursor(0, 0);
     lcd_print("Ganancia actual:");
 
-    // Cada fila combina el valor + el cursor "<" en la misma cadena, así
-    // todo el contenido de la fila se reescribe junto y no queda basura de
-    // un cursor anterior en otra posición de la misma línea.
-    // Layout por fila (LCD_COLS=20):
-    //   "High: +0dB         "   (+ '<' al final si es la banda activa)
-    //   "Mid:  +0dB         "
-    //   "Low:  +0dB         "
-    // Buffers con margen (48, no LCD_COLS+1): igual que se resolvió antes
-    // con line1, GCC con -Werror=format-truncation calcula el peor caso
-    // teórico de %f (un float puede representar números enormes) y lo
-    // rechaza si el buffer es ajustado, aunque en la práctica gain_db_*
-    // esté acotado a ±10 dB. Buffer holgado le permite a GCC garantizar
-    // en compilación que no hay truncamiento. lcd_print corta en el '\0',
-    // así que el contenido real impreso en el LCD no cambia.
     char line_high[48];
     char line_mid [48];
     char line_low [48];
@@ -1003,11 +905,6 @@ static void lcd_task(void *pv)
         eq_params_t p;
         if (xQueuePeek(param_config_queue, &p, 0) != pdPASS) continue;
 
-        // "High: +0dB" ocupa como máximo 11 caracteres con %+3.0f — el resto
-        // de la fila se rellena con espacios y el cursor "<" se agrega en la
-        // columna 19 solo si esa banda es la seleccionada, para que al
-        // cambiar de banda el "<" viejo se borre solo (queda sobreescrito
-        // por un espacio) sin necesidad de lcd_clear().
         snprintf(line_high, sizeof(line_high), "High: %+3.0fdB%*s",
                  p.gain_db_high, 8, p.selected_band == 2 ? "<" : "");
         snprintf(line_mid,  sizeof(line_mid),  "Mid:  %+3.0fdB%*s",
@@ -1015,8 +912,6 @@ static void lcd_task(void *pv)
         snprintf(line_low,  sizeof(line_low),  "Low:  %+3.0fdB%*s",
                  p.gain_db_low,  8, p.selected_band == 0 ? "<" : "");
 
-        // No se usa lcd_clear() en cada ciclo: reescribir con texto de igual
-        // longitud evita el parpadeo visible que produce borrar y redibujar.
         lcd_set_cursor(1, 0);
         lcd_print(line_high);
         lcd_set_cursor(2, 0);
@@ -1032,7 +927,6 @@ static void lcd_task(void *pv)
 
 void app_main(void)
 {
-    // ── NVS ──────────────────────────────────────────────────────────────────
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -1057,7 +951,6 @@ void app_main(void)
             ESP_LOGI(TAG, "Ganancias cargadas: L=%.1f M=%.1f H=%.1f dB",
                      p.gain_db_low, p.gain_db_mid, p.gain_db_high);
         }
-        // Publicar estado inicial — la cola queda con un mensaje válido desde el arranque
         xQueueOverwrite(param_config_queue, &p);
     }
 
@@ -1080,12 +973,7 @@ void app_main(void)
     lcd_init();
     ESP_LOGI("LCD","Init terminado");
 
-
-    // ── I2S ──────────────────────────────────────────────────────────────────
-    //ESP_ERROR_CHECK(i2s_init_full_duplex());
-
     // ── Inicialización de DSP ───────────────────────────────────────────────
-
     ESP_ERROR_CHECK(dsps_fft2r_init_fc32(NULL, CONFIG_DSP_MAX_FFT_SIZE));
 
     // ── Cola DSP ──────────────────────────────────────────────────────────────
@@ -1093,8 +981,6 @@ void app_main(void)
     configASSERT(dsp_queue);
 
     // ── Cola de eventos del encoder ────────────────────────────────────────
-    // uart_event_queue NO se crea acá: la crea uart_driver_install() dentro de
-    // uart_task y la entrega por puntero — acá solo se reserva el handle global.
     encoder_queue = xQueueCreate(ENCODER_QUEUE_LEN, sizeof(encoder_event_t));
     configASSERT(encoder_queue);
 
@@ -1103,10 +989,10 @@ void app_main(void)
     change_semaphore = xSemaphoreCreateBinary();
     configASSERT(change_semaphore);
 
-    // ── Semáforo binario de finalizacion DSP ────────────────────────────────
-    // Lo entrega DSP
-    dsp_done_sem = xSemaphoreCreateBinary();
-    configASSERT(dsp_done_sem);
+    // dsp_done_sem eliminado: la señal de "DSP terminó" ahora viaja como
+    // DSP_DONE_BIT en el mismo notify value de guardian_task que usa la
+    // ISR de I2S (I2S_RX_DONE_BIT) — unifica el mecanismo de sincronización
+    // dentro del core 0 sin necesitar un objeto FreeRTOS adicional.
 
     // ── Coeficientes FIR ─────────────────────────────────────────────────────
     init_fir_bands();
@@ -1135,9 +1021,6 @@ void app_main(void)
     // ya no necesita un TaskHandle_t externo porque las ISRs comunican por
     // encoder_queue en vez de xTaskNotifyFromISR.
     xTaskCreatePinnedToCore(encoder_task, "encoder", STACK_AUX, NULL, 4, NULL, 1);
-
-    // uart_task instala el driver UART (con su cola de eventos nativa) y
-    // procesa los comandos en el mismo bucle, sin tarea ni cola intermedia.
     xTaskCreatePinnedToCore(uart_task,    "uart",    STACK_AUX, NULL, 3, NULL, 1);
     xTaskCreatePinnedToCore(flash_task,   "flash",   STACK_AUX, NULL, 2, NULL, 1);
     xTaskCreatePinnedToCore(lcd_task,     "lcd",     STACK_AUX, NULL, 2, NULL, 1);
