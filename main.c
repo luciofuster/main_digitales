@@ -39,6 +39,10 @@
 #include "nvs.h"
 #include "esp_err.h"
 
+#include "driver/pulse_cnt.h"
+
+static pcnt_unit_handle_t encoder_pcnt_unit = NULL;
+
 static const char *TAG = "equalizer";
 
 // =============================================================================
@@ -662,108 +666,128 @@ static void uart_task(void *pv)
 #define ENCODER_SW_DEBOUNCE_MS  50
 
 // ISR de CLK — único flanco que dispara la lectura de dirección
-static void IRAM_ATTR encoder_clk_isr(void *arg)
-{
-    gpio_intr_disable(ENCODER_CLK);
-    int dt = gpio_get_level(ENCODER_DT);
-    encoder_event_t evt = dt ? ENCODER_EVT_ROTATE_CW : ENCODER_EVT_ROTATE_CCW;
-    BaseType_t woken = pdFALSE;
-    xQueueSendFromISR(encoder_queue, &evt, &woken);
-    portYIELD_FROM_ISR(woken);
-}
-
-// ISR del pulsador SW — flanco descendente (activo en bajo)
-static void IRAM_ATTR encoder_sw_isr(void *arg)
-{
-    // Deshabilitar la ISR del SW para debounce — la tarea la rehabilita
-    gpio_intr_disable(ENCODER_SW);
-
-    encoder_event_t evt = ENCODER_EVT_BUTTON;
-    BaseType_t woken = pdFALSE;
-    xQueueSendFromISR(encoder_queue, &evt, &woken);
-    portYIELD_FROM_ISR(woken);
-}
 
 static void encoder_task(void *pv)
 {
-    // ── Configurar GPIOs ────────────────────────────────────────────────────
-    // CLK: solo flanco descendente — es la única transición que dispara lectura
-    gpio_config_t clk_cfg = {
-        .pin_bit_mask = ((uint64_t)1 << ENCODER_CLK), // unit64_t porque tengo gpio mayor a 31
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_NEGEDGE,
+    ESP_LOGI(TAG, "encoder_task arrancó");
+    
+    // ── Configurar PCNT ─────────────────────────────────────────────────────
+    pcnt_unit_config_t unit_cfg = {
+        .high_limit = 100,
+        .low_limit  = -100,
     };
-    gpio_config(&clk_cfg);
+    ESP_ERROR_CHECK(pcnt_new_unit(&unit_cfg, &encoder_pcnt_unit));
+    ESP_LOGI(TAG, "pcnt_new_unit OK");
 
-    // DT: entrada simple, sin interrupción — solo se lee su nivel desde la ISR de CLK
-    gpio_config_t dt_cfg = {
-        .pin_bit_mask = ((uint64_t)1 << ENCODER_DT), // unit64_t porque tengo gpio mayor a 31
-        .mode         = GPIO_MODE_INPUT,
-        .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_DISABLE,
+    // Filtro antirebote: ignora pulsos más cortos que 2000 ns
+    //pcnt_glitch_filter_config_t filter_cfg = { .max_glitch_ns = 2000 };
+    //ESP_ERROR_CHECK(pcnt_unit_set_glitch_filter(encoder_pcnt_unit, &filter_cfg));
+    ESP_LOGI(TAG, "glitch_filter OK");
+
+    // Canal A: cuenta en flanco de CLK, con dirección dada por DT
+    pcnt_chan_config_t chan_a_cfg = {
+        .edge_gpio_num  = ENCODER_CLK,
+        .level_gpio_num = ENCODER_DT,
     };
-    gpio_config(&dt_cfg);
+    pcnt_channel_handle_t chan_a = NULL;
+    ESP_ERROR_CHECK(pcnt_new_channel(encoder_pcnt_unit, &chan_a_cfg, &chan_a));
 
-    // SW: flanco descendente (pulsación)
+    // Canal B: cuenta en flanco de DT, con dirección dada por CLK
+    pcnt_chan_config_t chan_b_cfg = {
+        .edge_gpio_num  = ENCODER_DT,
+        .level_gpio_num = ENCODER_CLK,
+    };
+    pcnt_channel_handle_t chan_b = NULL;
+    ESP_ERROR_CHECK(pcnt_new_channel(encoder_pcnt_unit, &chan_b_cfg, &chan_b));
+
+    // Acciones: decrementa/incrementa según flanco y nivel del otro canal
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chan_a,
+        PCNT_CHANNEL_EDGE_ACTION_DECREASE,
+        PCNT_CHANNEL_EDGE_ACTION_INCREASE));
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(chan_a,
+        PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+        PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
+
+    ESP_ERROR_CHECK(pcnt_channel_set_edge_action(chan_b,
+        PCNT_CHANNEL_EDGE_ACTION_INCREASE,
+        PCNT_CHANNEL_EDGE_ACTION_DECREASE));
+    ESP_ERROR_CHECK(pcnt_channel_set_level_action(chan_b,
+        PCNT_CHANNEL_LEVEL_ACTION_KEEP,
+        PCNT_CHANNEL_LEVEL_ACTION_INVERSE));
+
+    // Configurar SW como entrada con pull-up (sin PCNT, es un botón simple)
     gpio_config_t sw_cfg = {
-        .pin_bit_mask = ((uint64_t)1 << ENCODER_SW), // unit64_t porque tengo gpio mayor a 31
+        .pin_bit_mask = (1ULL << ENCODER_SW),
         .mode         = GPIO_MODE_INPUT,
         .pull_up_en   = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type    = GPIO_INTR_NEGEDGE,
+        .intr_type    = GPIO_INTR_DISABLE,   // polling, sin ISR
     };
     gpio_config(&sw_cfg);
 
-    // Registrar ISRs (servicio de ISR de GPIO debe estar instalado — ver app_main)
-    gpio_isr_handler_add(ENCODER_CLK, encoder_clk_isr, NULL);
-    gpio_isr_handler_add(ENCODER_SW,  encoder_sw_isr,  NULL);
+    ESP_ERROR_CHECK(pcnt_unit_enable(encoder_pcnt_unit));
+    ESP_LOGI(TAG, "pcnt_unit_enable OK");
+    ESP_ERROR_CHECK(pcnt_unit_clear_count(encoder_pcnt_unit));
+    ESP_ERROR_CHECK(pcnt_unit_start(encoder_pcnt_unit));
+    ESP_LOGI(TAG, "pcnt started, entrando al loop");
 
-    encoder_event_t evt;
+
+    int  ultimo_conteo  = 0;
+    bool sw_ultimo      = true;   // pull-up → reposo = 1
+    const int SENSIBILIDAD = 4;   // pulsos por clic físico (ajustar si cuenta de más/menos)
+
     while (1) {
-        // Bloquear hasta que alguna ISR encole un evento
-        if (xQueueReceive(encoder_queue, &evt, portMAX_DELAY) != pdPASS) continue;
+    int conteo_actual = 0;
+    pcnt_unit_get_count(encoder_pcnt_unit, &conteo_actual);
+    int delta = conteo_actual - ultimo_conteo;
 
-        // Leer parámetros actuales — read-modify-write sobre la cola
+    // ── Rotación ────────────────────────────────────────────────────────────
+    while (delta >= SENSIBILIDAD || delta <= -SENSIBILIDAD) {
+        float dir = (delta > 0) ? +1.0f : -1.0f;
+
         eq_params_t p;
         if (xQueuePeek(param_config_queue, &p, 0) != pdPASS) p = EQ_DEFAULTS;
 
-        if (evt == ENCODER_EVT_ROTATE_CW || evt == ENCODER_EVT_ROTATE_CCW) {
-            float delta = (evt == ENCODER_EVT_ROTATE_CW) ? +1.0f : -1.0f;
+        float *g = (p.selected_band == 0) ? &p.gain_db_low
+                 : (p.selected_band == 1) ? &p.gain_db_mid
+                                          : &p.gain_db_high;
+        *g += dir;
+        if (*g > GAIN_DB_MAX) *g = GAIN_DB_MAX;
+        if (*g < GAIN_DB_MIN) *g = GAIN_DB_MIN;
 
-            float *g = (p.selected_band == 0) ? &p.gain_db_low
-                     : (p.selected_band == 1) ? &p.gain_db_mid
-                                              : &p.gain_db_high;
-            *g += delta;
-            if (*g > GAIN_DB_MAX) *g = GAIN_DB_MAX;
-            if (*g < GAIN_DB_MIN) *g = GAIN_DB_MIN;
+        xQueueOverwrite(param_config_queue, &p);
+        xSemaphoreGive(change_semaphore);
 
-            xQueueOverwrite(param_config_queue, &p);
+        ESP_LOGI(TAG, "Ganancia banda %d → %.1f dB", p.selected_band, *g);
 
-            // Rehabilitar ISR del SW luego del período de debounce
-            vTaskDelay(pdMS_TO_TICKS(100));
-            gpio_intr_enable(ENCODER_CLK);
-
-            // Hubo cambio de ganancia → avisar a flash_task para que persista.
-            xSemaphoreGive(change_semaphore);
-
-        } else if (evt == ENCODER_EVT_BUTTON) {
-            p.selected_band = (p.selected_band + 1) % 3;
-            xQueueOverwrite(param_config_queue, &p);
-
-            ESP_LOGI(TAG, "Banda seleccionada: %s",
-                     p.selected_band == 0 ? "LOW" :
-                     p.selected_band == 1 ? "MID" : "HIGH");
-
-            // Cambiar de banda no modifica ganancia → no se notifica a flash_task
-
-            // Rehabilitar ISR del SW luego del período de debounce
-            vTaskDelay(pdMS_TO_TICKS(ENCODER_SW_DEBOUNCE_MS));
-            gpio_intr_enable(ENCODER_SW);
-        }
+        if (delta > 0) { ultimo_conteo += SENSIBILIDAD; delta -= SENSIBILIDAD; }
+        else           { ultimo_conteo -= SENSIBILIDAD; delta += SENSIBILIDAD; }
     }
+
+    // Resetear el contador cuando se aleja del centro para evitar overflow en los límites
+    if (ultimo_conteo > 50 || ultimo_conteo < -50) {
+        pcnt_unit_clear_count(encoder_pcnt_unit);
+        ultimo_conteo = 0;
+    }
+
+    // ── Pulsador SW ─────────────────────────────────────────────────────────
+    bool sw_actual = gpio_get_level(ENCODER_SW);
+    if (!sw_actual && sw_ultimo) {
+        eq_params_t p;
+        if (xQueuePeek(param_config_queue, &p, 0) != pdPASS) p = EQ_DEFAULTS;
+
+        p.selected_band = (p.selected_band + 1) % 3;
+        xQueueOverwrite(param_config_queue, &p);
+
+        ESP_LOGI(TAG, "Banda seleccionada: %s",
+                 p.selected_band == 0 ? "LOW" :
+                 p.selected_band == 1 ? "MID" : "HIGH");
+
+        vTaskDelay(pdMS_TO_TICKS(200));  // debounce del botón
+    }
+    sw_ultimo = sw_actual;
+
+    vTaskDelay(pdMS_TO_TICKS(10));
+}
 }
 
 // =============================================================================
@@ -944,7 +968,7 @@ static void lcd_task(void *pv)
     while (1) {
         // Bloqueo periódico preciso a 1 segundo: no se acumula deriva
         // aunque el cuerpo del bucle (transacciones I2C) tarde variablemente.
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(250));
 
         // Leer parámetros sin consumirlos — otras tareas también los leen
         eq_params_t p;
@@ -1054,7 +1078,7 @@ void app_main(void)
 
     // ── Servicio de ISR de GPIO (necesario para gpio_isr_handler_add) ────────
     // ESP_INTR_FLAG_IRAM: la ISR puede ejecutarse aunque la caché esté ocupada
-    gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
+    //gpio_install_isr_service(ESP_INTR_FLAG_IRAM);
 
     // ── Tareas ────────────────────────────────────────────────────────────────
     // Core 0 — audio en tiempo real
