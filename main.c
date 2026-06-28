@@ -973,13 +973,25 @@ static void lcd_task(void *pv)
 */
     // Encabezado fijo — se escribe una sola vez, nunca cambia
     lcd_set_cursor(0, 0);
-    lcd_print("ECUALIZADOR 3 BANDAS");
+    lcd_print("Ganancia actual:");
 
-    // line1: ganancias (buffer con margen para que GCC pueda garantizar,
-    //        en tiempo de compilación, que snprintf no truncará el formato
-    //        usado más abajo — ver comentario junto al snprintf)
-    // line2: cursor bajo la banda activa (20 columnas + '\0')
-    char line1[48], line2[LCD_COLS + 1];
+    // Cada fila combina el valor + el cursor "<" en la misma cadena, así
+    // todo el contenido de la fila se reescribe junto y no queda basura de
+    // un cursor anterior en otra posición de la misma línea.
+    // Layout por fila (LCD_COLS=20):
+    //   "High: +0dB         "   (+ '<' al final si es la banda activa)
+    //   "Mid:  +0dB         "
+    //   "Low:  +0dB         "
+    // Buffers con margen (48, no LCD_COLS+1): igual que se resolvió antes
+    // con line1, GCC con -Werror=format-truncation calcula el peor caso
+    // teórico de %f (un float puede representar números enormes) y lo
+    // rechaza si el buffer es ajustado, aunque en la práctica gain_db_*
+    // esté acotado a ±10 dB. Buffer holgado le permite a GCC garantizar
+    // en compilación que no hay truncamiento. lcd_print corta en el '\0',
+    // así que el contenido real impreso en el LCD no cambia.
+    char line_high[48];
+    char line_mid [48];
+    char line_low [48];
     TickType_t last_wake = xTaskGetTickCount();
 
     while (1) {
@@ -991,28 +1003,26 @@ static void lcd_task(void *pv)
         eq_params_t p;
         if (xQueuePeek(param_config_queue, &p, 0) != pdPASS) continue;
 
-        // Fila 1: "L:+0dB M:+0dB H:+0dB" — buffer de 48 bytes
-        // le permite a GCC garantizar en compilación que no hay truncamiento,
-        // eliminando el warning -Werror=format-truncation: con line1[21] el
-        // compilador calcula el peor caso teórico de %f y lo rechaza, aunque esté acotado a ±10 dB.
-        snprintf(line1, sizeof(line1), "L:%+3.0fdB M:%+3.0fdB H:%+3.0fdB",
-                 p.gain_db_low, p.gain_db_mid, p.gain_db_high);
-
-        // Fila 2: cursor "^" bajo la banda seleccionada.
-        // Cada bloque "L:+xxdB" ocupa 8 columnas → centros aprox en 2, 11, 20
-        memset(line2, ' ', LCD_COLS);
-        line2[LCD_COLS] = '\0';
-        int cursor_col = (p.selected_band == 0) ? 2
-                       : (p.selected_band == 1) ? 11
-                                                : 19;
-        line2[cursor_col] = '^';
+        // "High: +0dB" ocupa como máximo 11 caracteres con %+3.0f — el resto
+        // de la fila se rellena con espacios y el cursor "<" se agrega en la
+        // columna 19 solo si esa banda es la seleccionada, para que al
+        // cambiar de banda el "<" viejo se borre solo (queda sobreescrito
+        // por un espacio) sin necesidad de lcd_clear().
+        snprintf(line_high, sizeof(line_high), "High: %+3.0fdB%*s",
+                 p.gain_db_high, 8, p.selected_band == 2 ? "<" : "");
+        snprintf(line_mid,  sizeof(line_mid),  "Mid:  %+3.0fdB%*s",
+                 p.gain_db_mid,  8, p.selected_band == 1 ? "<" : "");
+        snprintf(line_low,  sizeof(line_low),  "Low:  %+3.0fdB%*s",
+                 p.gain_db_low,  8, p.selected_band == 0 ? "<" : "");
 
         // No se usa lcd_clear() en cada ciclo: reescribir con texto de igual
         // longitud evita el parpadeo visible que produce borrar y redibujar.
+        lcd_set_cursor(1, 0);
+        lcd_print(line_high);
         lcd_set_cursor(2, 0);
-        lcd_print(line1);
+        lcd_print(line_mid);
         lcd_set_cursor(3, 0);
-        lcd_print(line2);
+        lcd_print(line_low);
     }
 }
 
