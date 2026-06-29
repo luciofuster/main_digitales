@@ -978,7 +978,7 @@ static void lcd_task(void *pv)
     while (1) {
         // Bloqueo periódico preciso a 1 segundo: no se acumula deriva
         // aunque el cuerpo del bucle (transacciones I2C) tarde variablemente.
-        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(1000));
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(250));
 
         // Leer parámetros sin consumirlos — otras tareas también los leen
         eq_params_t p;
